@@ -387,8 +387,8 @@ def maybe_notify(result: app.AnalysisResult, state_path: Path) -> dict[str, obje
         last_key = str(state.get("last_main_signal_key", state.get("last_signal_key", "")))
         last_sent_at = parse_time(state.get("last_main_sent_at") or state.get("last_sent_at"))
         cooldown = timedelta(minutes=int(config.get("cooldown_minutes", 180)))
-        same_side = key == last_key or last_key.startswith(f"{key}|")
-        if same_side and last_sent_at and now - last_sent_at < cooldown:
+        same_setup = key == last_key
+        if same_setup and last_sent_at and now - last_sent_at < cooldown:
             state["last_status"] = "本命cooldown"
             write_json(state_path, state)
             return state

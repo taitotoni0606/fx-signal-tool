@@ -666,6 +666,17 @@ def parse_bls_events() -> list[EventItem]:
     return events
 
 
+def normalize_event_impact(value: object) -> str:
+    if value is None or pd.isna(value):
+        return "high"
+    impact = str(value).strip().lower()
+    if impact in {"", "nan", "none", "null"}:
+        return "high"
+    if impact not in {"low", "medium", "high"}:
+        return "high"
+    return impact
+
+
 def load_custom_events() -> list[EventItem]:
     if not CUSTOM_EVENTS_PATH.exists():
         return []
@@ -684,32 +695,43 @@ def load_custom_events() -> list[EventItem]:
                 event_date=day,
                 title=str(row["title"]),
                 source="manual",
-                impact=str(row.get("impact", "high")),
+                impact=normalize_event_impact(row.get("impact", "high")),
             )
         )
     return events
 
 
 @st.cache_data(ttl=12 * 60 * 60, show_spinner=False)
-def fetch_policy_events() -> list[EventItem]:
+def fetch_policy_events_payload() -> tuple[list[EventItem], list[str]]:
     year = datetime.now(JST).year
     events: list[EventItem] = []
+    warnings: list[str] = []
     try:
         events.extend(parse_fomc_events(year))
         events.extend(parse_fomc_events(year + 1))
     except Exception:
-        pass
+        warnings.append("FOMC予定を取得できませんでした")
     try:
         events.extend(parse_boj_events(year))
     except Exception:
-        pass
+        warnings.append("日銀予定を取得できませんでした")
     try:
         events.extend(parse_bls_events())
     except Exception:
-        pass
+        warnings.append("米指標予定を取得できませんでした")
     events.extend(load_custom_events())
     unique = {(item.event_date, item.title): item for item in events}
-    return sorted(unique.values(), key=lambda item: item.event_date)
+    return sorted(unique.values(), key=lambda item: item.event_date), warnings
+
+
+def fetch_policy_events() -> list[EventItem]:
+    events, _ = fetch_policy_events_payload()
+    return events
+
+
+def fetch_policy_event_warnings() -> list[str]:
+    _, warnings = fetch_policy_events_payload()
+    return warnings
 
 
 def build_event_risk_at(events: list[EventItem], now: datetime) -> EventRisk:
@@ -724,12 +746,20 @@ def build_event_risk_at(events: list[EventItem], now: datetime) -> EventRisk:
 
     for event in future:
         delta = (event.event_date - today).days
+        impact = normalize_event_impact(event.impact)
+        if impact == "low":
+            continue
         if -1 <= delta <= 1:
-            level = "high"
-            title = "重要イベント前後"
-            score_cap = 60
+            if impact == "high":
+                level = "high"
+                title = "重要イベント前後"
+                score_cap = 60
+            elif level != "high":
+                level = "medium"
+                title = "イベント前後"
+                score_cap = 72
             items.append(f"{event.event_date:%m/%d}: {event.title}")
-        elif 2 <= delta <= 5 and level != "high":
+        elif impact == "high" and 2 <= delta <= 5 and level != "high":
             level = "medium"
             title = "重要イベント接近"
             score_cap = 72
@@ -750,6 +780,8 @@ def build_event_risk_at(events: list[EventItem], now: datetime) -> EventRisk:
         warnings.append("重要イベント前後は、テクニカルの候補価格が機能しにくい場合があります")
     elif level == "medium":
         warnings.append("数日内に重要イベントがあり、ポジション持ち越しは注意")
+    if not events:
+        warnings.append("外部イベント予定が取得できていないため、重要指標フィルターは弱めです")
 
     return EventRisk(
         level=level,
@@ -1052,6 +1084,28 @@ def default_notification_config() -> dict[str, object]:
     }
 
 
+def coerce_bool(value: object, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off"}:
+            return False
+    if isinstance(value, (int, float)) and np.isfinite(value):
+        return bool(value)
+    return default
+
+
+def coerce_int(value: object, default: int, min_value: int, max_value: int) -> int:
+    try:
+        number = int(float(str(value).strip())) if isinstance(value, str) else int(value)  # type: ignore[arg-type]
+    except Exception:
+        return default
+    return max(min_value, min(max_value, number))
+
+
 def load_notification_config() -> dict[str, object]:
     if not NOTIFICATION_CONFIG_PATH.exists():
         config = default_notification_config()
@@ -1061,10 +1115,27 @@ def load_notification_config() -> dict[str, object]:
         loaded = json.loads(NOTIFICATION_CONFIG_PATH.read_text(encoding="utf-8"))
     except Exception:
         loaded = {}
+    if not isinstance(loaded, dict):
+        loaded = {}
     config = default_notification_config()
-    config.update({k: v for k, v in loaded.items() if v is not None})
-    if not str(config.get("topic", "")).strip():
-        config["topic"] = default_notification_config()["topic"]
+    topic = str(loaded.get("topic", config["topic"]) or "").strip()
+    config["topic"] = topic or str(config["topic"])
+    config["enabled"] = coerce_bool(loaded.get("enabled"), bool(config["enabled"]))
+    config["score_threshold"] = coerce_int(loaded.get("score_threshold"), int(config["score_threshold"]), 50, 90)
+    config["candidate_score_threshold"] = coerce_int(
+        loaded.get("candidate_score_threshold"),
+        int(config["candidate_score_threshold"]),
+        40,
+        int(config["score_threshold"]),
+    )
+    config["daily_summary_hour"] = coerce_int(loaded.get("daily_summary_hour"), int(config["daily_summary_hour"]), 0, 23)
+    config["live_filter_enabled"] = coerce_bool(loaded.get("live_filter_enabled"), bool(config["live_filter_enabled"]))
+    config["interval_minutes"] = coerce_int(loaded.get("interval_minutes"), int(config["interval_minutes"]), 5, 120)
+    config["cooldown_minutes"] = coerce_int(loaded.get("cooldown_minutes"), int(config["cooldown_minutes"]), 30, 720)
+    config["notify_during_high_event"] = coerce_bool(
+        loaded.get("notify_during_high_event"),
+        bool(config["notify_during_high_event"]),
+    )
     return config
 
 
@@ -1210,7 +1281,22 @@ def notification_decision(result: AnalysisResult, config: dict[str, object]) -> 
 
 
 def signal_key(setup: Setup) -> str:
-    return setup.bias
+    def bucket(value: float) -> str:
+        if not np.isfinite(value):
+            return "na"
+        return f"{value:.2f}"
+
+    score_bucket = int(setup.score // 5 * 5)
+    return "|".join(
+        [
+            setup.bias,
+            str(score_bucket),
+            bucket(setup.entry_low),
+            bucket(setup.entry_high),
+            bucket(setup.stop),
+            bucket(setup.target_1),
+        ]
+    )
 
 
 def build_notification_message(
@@ -1309,18 +1395,28 @@ def evaluate_trade_exit(
     stop: float,
     target: float,
     max_hold_bars: int,
+    same_bar_policy: str = "conservative",
 ) -> tuple[object, float, str]:
     hold = future.head(max_hold_bars)
     if hold.empty:
         return None, entry, "no_data"
 
     for bar_time, bar in hold.iterrows():
+        open_price = float(bar["Open"])
+        close = float(bar["Close"])
         high = float(bar["High"])
         low = float(bar["Low"])
         if side == "buy":
             stop_hit = low <= stop
             target_hit = high >= target
             if stop_hit and target_hit:
+                if same_bar_policy == "ohlc_path":
+                    if open_price <= stop:
+                        return bar_time, stop, "loss"
+                    if open_price >= target:
+                        return bar_time, target, "win"
+                    if close < open_price:
+                        return bar_time, target, "win_estimated"
                 return bar_time, stop, "loss"
             if target_hit:
                 return bar_time, target, "win"
@@ -1330,6 +1426,13 @@ def evaluate_trade_exit(
             stop_hit = high >= stop
             target_hit = low <= target
             if stop_hit and target_hit:
+                if same_bar_policy == "ohlc_path":
+                    if open_price >= stop:
+                        return bar_time, stop, "loss"
+                    if open_price <= target:
+                        return bar_time, target, "win"
+                    if close >= open_price:
+                        return bar_time, target, "win_estimated"
                 return bar_time, stop, "loss"
             if target_hit:
                 return bar_time, target, "win"
@@ -1354,11 +1457,20 @@ def find_entry(
         entry_price = float(future.iloc[0]["Open"])
         return entry_time, entry_price, future
 
-    entry_price = (setup.entry_low + setup.entry_high) / 2
     search = future.head(expire_bars)
     for entry_time, bar in search.iterrows():
-        if float(bar["Low"]) <= entry_price <= float(bar["High"]):
-            return entry_time, float(entry_price), future.loc[entry_time:]
+        open_price = float(bar["Open"])
+        low = float(bar["Low"])
+        high = float(bar["High"])
+        if high < setup.entry_low or low > setup.entry_high:
+            continue
+        if setup.bias == "buy":
+            entry_price = setup.entry_high if open_price > setup.entry_high else setup.entry_low
+        else:
+            entry_price = setup.entry_low if open_price < setup.entry_low else setup.entry_high
+        if setup.entry_low <= open_price <= setup.entry_high:
+            entry_price = open_price
+        return entry_time, float(entry_price), future.loc[entry_time:]
     return None
 
 
@@ -1459,6 +1571,7 @@ def run_backtest(
     step_bars: int,
     spread_pips: float = 0.2,
     slippage_pips: float = 0.1,
+    same_bar_policy: str = "conservative",
 ) -> BacktestResult:
     hourly_raw, daily_raw = fetch_backtest_prices(TICKER, period)
     if hourly_raw.empty or daily_raw.empty:
@@ -1524,6 +1637,7 @@ def run_backtest(
             setup.stop,
             target,
             max_hold_bars,
+            same_bar_policy,
         )
         if exit_time is None:
             skipped += 1
@@ -1679,6 +1793,7 @@ def compare_backtest_settings(
     step_bars: int,
     spread_pips: float,
     slippage_pips: float,
+    same_bar_policy: str,
 ) -> pd.DataFrame:
     rows = []
     for threshold, hold_bars, target_choice in scenarios:
@@ -1692,6 +1807,7 @@ def compare_backtest_settings(
             int(step_bars),
             float(spread_pips),
             float(slippage_pips),
+            same_bar_policy,
         )
         train, test = split_trades_for_walk_forward(result.trades)
         train_metrics = trade_metrics(train)
@@ -1802,9 +1918,16 @@ def render_backtest_section(default_threshold: int) -> None:
             step=0.1,
             help="注文した価格から少しずれて約定する想定コストです。急変時ほど大きくなりやすいです。",
         )
+    same_bar_policy_label = st.selectbox(
+        "同じ足で利確と損切りに届いた時",
+        ["保守的に損切り優先", "ローソク足の流れで推定"],
+        index=0,
+        help="1時間足の中でどちらが先に到達したかは完全には分からないため、標準では厳しめに損切り優先で見ます。",
+    )
 
     entry_mode = "next_open" if entry_mode_label == "次の足の始値" else "candidate_zone"
     target_choice = "target_2" if target_choice_label == "第2利確" else "target_1"
+    same_bar_policy = "ohlc_path" if same_bar_policy_label == "ローソク足の流れで推定" else "conservative"
     with st.spinner("バックテスト中..."):
         result = run_backtest(
             period,
@@ -1816,6 +1939,7 @@ def render_backtest_section(default_threshold: int) -> None:
             int(step_bars),
             float(spread_pips),
             float(slippage_pips),
+            same_bar_policy,
         )
 
     m1, m2, m3, m4, m5 = st.columns(5)
@@ -1895,6 +2019,7 @@ def render_backtest_section(default_threshold: int) -> None:
                         max(4, int(step_bars)),
                         float(spread_pips),
                         float(slippage_pips),
+                        same_bar_policy,
                     )
                 st.dataframe(comparison.head(20), use_container_width=True, hide_index=True)
             else:
@@ -1926,6 +2051,7 @@ def analyze_market() -> AnalysisResult:
     if treasury_warning:
         macro.warnings.append(treasury_warning)
     event_risk = build_event_risk(events)
+    event_risk.warnings.extend(fetch_policy_event_warnings())
     setup = build_setup(PAIR, hourly, h4, daily, regime, macro, event_risk)
     current_price = float(hourly.iloc[-1]["Close"])
     latest_time = hourly.index[-1]
@@ -2021,7 +2147,7 @@ def main() -> None:
     if refresh:
         fetch_prices.clear()
         fetch_treasury_yields.clear()
-        fetch_policy_events.clear()
+        fetch_policy_events_payload.clear()
 
     try:
         with st.spinner("データを取得しています..."):

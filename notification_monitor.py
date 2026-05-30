@@ -13,11 +13,8 @@ LOG_PATH = Path(__file__).resolve().parent / "notification_monitor.log"
 
 def log(message: str) -> None:
     stamp = datetime.now(app.JST).strftime("%Y-%m-%d %H:%M:%S")
-    LOG_PATH.write_text(
-        (LOG_PATH.read_text(encoding="utf-8") if LOG_PATH.exists() else "")
-        + f"[{stamp}] {message}\n",
-        encoding="utf-8",
-    )
+    with LOG_PATH.open("a", encoding="utf-8") as handle:
+        handle.write(f"[{stamp}] {message}\n")
 
 
 def parse_time(value: object) -> datetime | None:
@@ -89,8 +86,8 @@ def run_check() -> None:
         last_key = str(state.get("last_main_signal_key", state.get("last_signal_key", "")))
         last_sent_at = parse_time(state.get("last_main_sent_at") or state.get("last_sent_at"))
         cooldown = timedelta(minutes=int(config.get("cooldown_minutes", 180)))
-        same_side = key == last_key or last_key.startswith(f"{key}|")
-        if same_side and last_sent_at and now - last_sent_at < cooldown:
+        same_setup = key == last_key
+        if same_setup and last_sent_at and now - last_sent_at < cooldown:
             state["last_status"] = "main cooldown"
             app.save_notification_state(state)
             log(f"skip: main cooldown; signal={setup.direction}; score={setup.score}")
