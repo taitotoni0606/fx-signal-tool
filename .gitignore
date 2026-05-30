@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.pyc
+*.log
+*.out.log
+*.err.log
+notification_state.json
+notification_settings.json
+.env
+notification_monitor.log
+notification_monitor.out.log
+notification_monitor.err.log
+public/
+.state/

@@ -1,7 +1,7 @@
-streamlit
-pandas
-numpy
-yfinance
-plotly
-requests
-beautifulsoup4
+streamlit==1.58.0
+pandas==3.0.3
+numpy==2.4.6
+yfinance==1.4.1
+plotly==6.7.0
+requests==2.34.2
+beautifulsoup4==4.14.3

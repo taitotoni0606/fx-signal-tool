@@ -26,6 +26,8 @@ CUSTOM_EVENTS_PATH = APP_DIR / "events_usdjpy.csv"
 NOTIFICATION_CONFIG_PATH = APP_DIR / "notification_settings.json"
 NOTIFICATION_STATE_PATH = APP_DIR / "notification_state.json"
 NTFY_SERVER = "https://ntfy.sh"
+DEFAULT_DASHBOARD_URL = "http://localhost:8501"
+BLS_CALENDAR_URL = "https://www.bls.gov/schedule/news_release/bls.ics"
 
 
 @dataclass
@@ -545,6 +547,64 @@ def parse_boj_events(year: int) -> list[EventItem]:
     return events
 
 
+def unfold_ics_lines(text: str) -> list[str]:
+    lines: list[str] = []
+    for raw in text.splitlines():
+        if raw.startswith((" ", "\t")) and lines:
+            lines[-1] += raw[1:]
+        else:
+            lines.append(raw)
+    return lines
+
+
+def parse_ics_date(line: str) -> date | None:
+    if ":" not in line:
+        return None
+    value = line.split(":", 1)[1].strip()
+    if len(value) < 8:
+        return None
+    try:
+        return datetime.strptime(value[:8], "%Y%m%d").date()
+    except ValueError:
+        return None
+
+
+def parse_bls_events() -> list[EventItem]:
+    response = requests.get(BLS_CALENDAR_URL, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+    response.raise_for_status()
+    text = response.text
+    lines = unfold_ics_lines(text)
+    events: list[EventItem] = []
+    current: dict[str, str] = {}
+    watched = {
+        "Employment Situation": "米雇用統計",
+        "Consumer Price Index": "米CPI",
+        "Producer Price Index": "米PPI",
+        "Real Earnings": "米実質賃金",
+    }
+
+    for line in lines:
+        if line == "BEGIN:VEVENT":
+            current = {}
+            continue
+        if line == "END:VEVENT":
+            title = current.get("SUMMARY", "")
+            day = parse_ics_date(current.get("DTSTART", ""))
+            if day:
+                for keyword, label in watched.items():
+                    if keyword in title:
+                        events.append(EventItem(day, label, "BLS", "high"))
+                        break
+            current = {}
+            continue
+        if line.startswith("SUMMARY"):
+            current["SUMMARY"] = line.split(":", 1)[1] if ":" in line else ""
+        elif line.startswith("DTSTART"):
+            current["DTSTART"] = line
+
+    return events
+
+
 def load_custom_events() -> list[EventItem]:
     if not CUSTOM_EVENTS_PATH.exists():
         return []
@@ -582,6 +642,10 @@ def fetch_policy_events() -> list[EventItem]:
         events.extend(parse_boj_events(year))
     except Exception:
         pass
+    try:
+        events.extend(parse_bls_events())
+    except Exception:
+        pass
     events.extend(load_custom_events())
     unique = {(item.event_date, item.title): item for item in events}
     return sorted(unique.values(), key=lambda item: item.event_date)
@@ -611,11 +675,16 @@ def build_event_risk(events: list[EventItem]) -> EventRisk:
             score_cap = 72
             items.append(f"{event.event_date:%m/%d}: {event.title}")
 
-    if now.weekday() < 5 and (now.hour == 21 or now.hour == 22 or (now.hour == 23 and now.minute <= 15)):
+    if now.weekday() < 5 and (
+        now.hour == 21
+        or now.hour == 22
+        or (now.hour == 23 and now.minute <= 15)
+        or (now.hour == 0 and now.minute <= 15)
+    ):
         level = "high"
         title = "米指標時間帯"
         score_cap = 60
-        items.append("21:00-23:15 JSTは米指標発表が多く、急変しやすい時間帯")
+        items.append("21:00-00:15 JSTは米指標発表が多く、急変しやすい時間帯")
 
     if level == "high":
         warnings.append("重要イベント前後は、テクニカルの候補価格が機能しにくい場合があります")
@@ -968,19 +1037,27 @@ def ntfy_header_text(value: str, fallback: str) -> str:
     return safe or fallback
 
 
-def send_ntfy_notification(topic: str, title: str, message: str, priority: str = "default") -> None:
+def send_ntfy_notification(
+    topic: str,
+    title: str,
+    message: str,
+    priority: str = "default",
+    click_url: str = DEFAULT_DASHBOARD_URL,
+) -> None:
     safe_topic = topic.strip()
     if not safe_topic:
         raise ValueError("通知トピックが未設定です。")
+    headers = {
+        "Title": ntfy_header_text(title, "USDJPY Signal"),
+        "Priority": priority,
+        "Tags": "chart_with_upwards_trend",
+    }
+    if click_url:
+        headers["Click"] = click_url
     response = requests.post(
         notification_topic_url(safe_topic),
         data=message.encode("utf-8"),
-        headers={
-            "Title": ntfy_header_text(title, "USDJPY Signal"),
-            "Priority": priority,
-            "Tags": "chart_with_upwards_trend",
-            "Click": "http://localhost:8501",
-        },
+        headers=headers,
         timeout=15,
     )
     response.raise_for_status()
@@ -999,16 +1076,7 @@ def is_entry_chance(setup: Setup, event_risk: EventRisk, config: dict[str, objec
 
 
 def signal_key(setup: Setup) -> str:
-    return "|".join(
-        [
-            setup.bias,
-            str(setup.score),
-            f"{setup.entry_low:.3f}",
-            f"{setup.entry_high:.3f}",
-            f"{setup.stop:.3f}" if np.isfinite(setup.stop) else "nan",
-            f"{setup.target_1:.3f}" if np.isfinite(setup.target_1) else "nan",
-        ]
-    )
+    return setup.bias
 
 
 def build_notification_message(result: AnalysisResult) -> tuple[str, str]:
@@ -1042,10 +1110,17 @@ def analyze_market() -> AnalysisResult:
     if len(hourly) < 80 or len(h4) < 40 or len(daily) < 80:
         raise RuntimeError("分析に必要な本数が足りません。")
 
-    treasury = fetch_treasury_yields()
+    treasury_warning = ""
+    try:
+        treasury = fetch_treasury_yields()
+    except Exception as exc:
+        treasury = pd.DataFrame(columns=["date", "2Y", "10Y"])
+        treasury_warning = f"米金利データを取得できなかったため、金利フィルターは中立扱いです: {exc}"
     events = fetch_policy_events()
     regime = analyze_regime(h4)
     macro = build_macro_context(treasury)
+    if treasury_warning:
+        macro.warnings.append(treasury_warning)
     event_risk = build_event_risk(events)
     setup = build_setup(PAIR, hourly, h4, daily, regime, macro, event_risk)
     current_price = float(hourly.iloc[-1]["Close"])

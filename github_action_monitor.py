@@ -8,8 +8,21 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import numpy as np
+import requests
 
 import app
+
+
+def default_dashboard_url() -> str:
+    repository = os.getenv("GITHUB_REPOSITORY", "").strip()
+    if "/" in repository:
+        owner, repo = repository.split("/", 1)
+        return f"https://{owner}.github.io/{repo}/"
+    return "https://taitotoni0606.github.io/fx-signal-tool/"
+
+
+def normalize_url(url: str) -> str:
+    return url.strip().rstrip("/") + "/" if url.strip() else default_dashboard_url()
 
 
 def env_bool(name: str, default: bool) -> bool:
@@ -26,6 +39,7 @@ def github_config() -> dict[str, object]:
         "score_threshold": int(os.getenv("SCORE_THRESHOLD", "68")),
         "cooldown_minutes": int(os.getenv("COOLDOWN_MINUTES", "180")),
         "notify_during_high_event": env_bool("NOTIFY_DURING_HIGH_EVENT", False),
+        "dashboard_url": normalize_url(os.getenv("DASHBOARD_URL", default_dashboard_url())),
     }
 
 
@@ -36,6 +50,32 @@ def read_json(path: Path) -> dict[str, object]:
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return {}
+
+
+def published_state_url(dashboard_url: str) -> str:
+    return normalize_url(dashboard_url) + "notification_state.json"
+
+
+def read_published_state(dashboard_url: str) -> dict[str, object]:
+    try:
+        response = requests.get(
+            published_state_url(dashboard_url),
+            timeout=10,
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        if response.ok:
+            data = response.json()
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        pass
+    return {}
+
+
+def load_state(state_path: Path, dashboard_url: str) -> dict[str, object]:
+    local_state = read_json(state_path)
+    if local_state:
+        return local_state
+    return read_published_state(dashboard_url)
 
 
 def write_json(path: Path, data: dict[str, object]) -> None:
@@ -287,7 +327,7 @@ def generate_dashboard(result: app.AnalysisResult, state: dict[str, object], out
 
 def maybe_notify(result: app.AnalysisResult, state_path: Path) -> dict[str, object]:
     config = github_config()
-    state = read_json(state_path)
+    state = load_state(state_path, str(config.get("dashboard_url", "")))
     now = datetime.now(app.JST)
 
     ok, reason = app.is_entry_chance(result.setup, result.event_risk, config)
@@ -314,14 +354,21 @@ def maybe_notify(result: app.AnalysisResult, state_path: Path) -> dict[str, obje
     last_key = str(state.get("last_signal_key", ""))
     last_sent_at = parse_time(state.get("last_sent_at"))
     cooldown = timedelta(minutes=int(config.get("cooldown_minutes", 180)))
-    if key == last_key and last_sent_at and now - last_sent_at < cooldown:
+    same_side = key == last_key or last_key.startswith(f"{key}|")
+    if same_side and last_sent_at and now - last_sent_at < cooldown:
         state["last_status"] = "cooldown"
         write_json(state_path, state)
         return state
 
     title, message = app.build_notification_message(result)
     priority = "high" if result.setup.score >= int(config.get("score_threshold", 68)) + 8 else "default"
-    app.send_ntfy_notification(str(config["topic"]), title, message, priority=priority)
+    app.send_ntfy_notification(
+        str(config["topic"]),
+        title,
+        message,
+        priority=priority,
+        click_url=str(config.get("dashboard_url", "")),
+    )
     state.update(
         {
             "last_signal_key": key,
@@ -344,16 +391,18 @@ def main() -> None:
 
     state_path = Path(args.state)
     output_path = Path(args.output)
+    config = github_config()
     app.ensure_custom_events_file()
     result = app.analyze_market()
     if args.no_notify:
-        state = read_json(state_path)
+        state = load_state(state_path, str(config.get("dashboard_url", "")))
         state["last_checked_at"] = datetime.now(app.JST).isoformat()
         state["last_status"] = "dashboard only"
         write_json(state_path, state)
     else:
         state = maybe_notify(result, state_path)
     generate_dashboard(result, state, output_path)
+    write_json(output_path.parent / "notification_state.json", state)
     print(json.dumps({"status": state.get("last_status"), "score": result.setup.score, "direction": result.setup.direction}, ensure_ascii=False))
 
 

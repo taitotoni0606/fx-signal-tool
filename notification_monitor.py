@@ -66,8 +66,9 @@ def run_check() -> None:
     last_key = str(state.get("last_signal_key", ""))
     last_sent_at = parse_time(state.get("last_sent_at"))
     cooldown = timedelta(minutes=int(config.get("cooldown_minutes", 180)))
+    same_side = key == last_key or last_key.startswith(f"{key}|")
 
-    if key == last_key and last_sent_at and now - last_sent_at < cooldown:
+    if same_side and last_sent_at and now - last_sent_at < cooldown:
         state["last_status"] = "cooldown"
         state["last_checked_at"] = now.isoformat()
         app.save_notification_state(state)
