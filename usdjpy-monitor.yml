@@ -1,0 +1,66 @@
+name: USDJPY Monitor
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "7,22,37,52 * * * *"
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore notification state
+        uses: actions/cache/restore@v4
+        with:
+          path: .state
+          key: usdjpy-state-${{ github.run_id }}
+          restore-keys: |
+            usdjpy-state-
+
+      - name: Analyze, notify, and build mobile page
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          SCORE_THRESHOLD: "68"
+          COOLDOWN_MINUTES: "180"
+          NOTIFY_DURING_HIGH_EVENT: "false"
+        run: python github_action_monitor.py --state .state/notification_state.json --output public/index.html
+
+      - name: Save notification state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .state
+          key: usdjpy-state-${{ github.run_id }}
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: public
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
