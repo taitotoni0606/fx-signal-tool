@@ -114,6 +114,9 @@ class BacktestTrade:
     exit_time: object
     side: str
     score: int
+    regime: str
+    regime_group: str
+    session: str
     entry: float
     stop: float
     target: float
@@ -121,6 +124,8 @@ class BacktestTrade:
     result: str
     pips: float
     r_multiple: float
+    gross_pips: float
+    cost_pips: float
 
 
 @dataclass
@@ -1208,6 +1213,31 @@ def yields_until(yields: pd.DataFrame, current_day: date) -> pd.DataFrame:
     return yields[yields["date"] <= current_day].copy()
 
 
+def regime_group_name(regime_name: str) -> str:
+    if "トレンド" in regime_name:
+        return "トレンド"
+    if "レンジ" in regime_name:
+        return "レンジ"
+    if "ボラ" in regime_name:
+        return "ボラ拡大"
+    return "中立/確認中"
+
+
+def session_name(value: object) -> str:
+    ts = pd.Timestamp(value)
+    if ts.tzinfo is None:
+        hour = ts.hour
+    else:
+        hour = ts.tz_convert(JST).hour
+    if 7 <= hour < 15:
+        return "東京"
+    if 15 <= hour < 21:
+        return "ロンドン"
+    if hour >= 21 or hour < 2:
+        return "NY"
+    return "薄商い"
+
+
 def evaluate_trade_exit(
     future: pd.DataFrame,
     side: str,
@@ -1323,6 +1353,37 @@ def summarize_backtest(trades: list[BacktestTrade], checked: int, skipped: int) 
     )
 
 
+def trade_metrics(trades: list[BacktestTrade]) -> dict[str, float | int]:
+    if not trades:
+        return {
+            "trades": 0,
+            "win_rate": 0.0,
+            "total_r": 0.0,
+            "average_r": 0.0,
+            "profit_factor": 0.0,
+            "max_drawdown_r": 0.0,
+        }
+    r_values = [trade.r_multiple for trade in trades]
+    wins = [value for value in r_values if value > 0]
+    losses = [value for value in r_values if value < 0]
+    equity = np.cumsum(r_values)
+    peak = np.maximum.accumulate(equity)
+    drawdown = equity - peak
+    profit_factor = float(np.sum(wins) / abs(np.sum(losses))) if losses else float("inf")
+    return {
+        "trades": len(trades),
+        "win_rate": len(wins) / len(trades) * 100,
+        "total_r": float(np.sum(r_values)),
+        "average_r": float(np.mean(r_values)),
+        "profit_factor": profit_factor,
+        "max_drawdown_r": abs(float(drawdown.min())) if len(drawdown) else 0.0,
+    }
+
+
+def pf_label(value: float) -> str:
+    return "∞" if np.isinf(value) else f"{value:.2f}"
+
+
 @st.cache_data(ttl=15 * 60, show_spinner=False)
 def run_backtest(
     period: str,
@@ -1332,6 +1393,8 @@ def run_backtest(
     max_hold_bars: int,
     target_choice: str,
     step_bars: int,
+    spread_pips: float = 0.2,
+    slippage_pips: float = 0.1,
 ) -> BacktestResult:
     hourly_raw, daily_raw = fetch_backtest_prices(TICKER, period)
     if hourly_raw.empty or daily_raw.empty:
@@ -1403,8 +1466,10 @@ def run_backtest(
             continue
 
         raw_profit = exit_price - entry_price if setup.bias == "buy" else entry_price - exit_price
-        pips = raw_profit * 100
-        r_multiple = raw_profit / risk
+        gross_pips = raw_profit * 100
+        cost_pips = max(0.0, float(spread_pips) + float(slippage_pips))
+        pips = gross_pips - cost_pips
+        r_multiple = (pips / 100) / risk
         trades.append(
             BacktestTrade(
                 signal_time=current_time,
@@ -1412,6 +1477,9 @@ def run_backtest(
                 exit_time=exit_time,
                 side=setup.bias,
                 score=setup.score,
+                regime=regime.name,
+                regime_group=regime_group_name(regime.name),
+                session=session_name(entry_time),
                 entry=float(entry_price),
                 stop=float(setup.stop),
                 target=float(target),
@@ -1419,6 +1487,8 @@ def run_backtest(
                 result=result,
                 pips=float(pips),
                 r_multiple=float(r_multiple),
+                gross_pips=float(gross_pips),
+                cost_pips=float(cost_pips),
             )
         )
         next_allowed_position = min(len(hourly), position + max_hold_bars)
@@ -1436,12 +1506,17 @@ def backtest_trades_frame(trades: list[BacktestTrade]) -> pd.DataFrame:
                 "exit_time": trade.exit_time,
                 "side": "買い" if trade.side == "buy" else "売り",
                 "score": trade.score,
+                "regime": trade.regime,
+                "regime_group": trade.regime_group,
+                "session": trade.session,
                 "entry": round(trade.entry, 3),
                 "stop": round(trade.stop, 3),
                 "target": round(trade.target, 3),
                 "exit": round(trade.exit_price, 3),
                 "result": trade.result,
                 "pips": round(trade.pips, 1),
+                "gross_pips": round(trade.gross_pips, 1),
+                "cost_pips": round(trade.cost_pips, 1),
                 "R": round(trade.r_multiple, 2),
             }
         )
@@ -1473,44 +1548,223 @@ def backtest_equity_figure(trades: list[BacktestTrade]) -> go.Figure:
     return fig
 
 
+def metrics_frame(rows: list[dict[str, object]]) -> pd.DataFrame:
+    frame = pd.DataFrame(rows)
+    if frame.empty:
+        return frame
+    for column in ["勝率", "合計R", "平均R", "最大DD"]:
+        if column in frame.columns:
+            frame[column] = frame[column].astype(float).round(2)
+    return frame
+
+
+def grouped_backtest_frame(trades: list[BacktestTrade], label: str, group_func) -> pd.DataFrame:
+    groups: dict[str, list[BacktestTrade]] = {}
+    for trade in trades:
+        groups.setdefault(str(group_func(trade)), []).append(trade)
+    rows = []
+    for group, group_trades in sorted(groups.items(), key=lambda item: item[0]):
+        metrics = trade_metrics(group_trades)
+        rows.append(
+            {
+                label: group,
+                "取引数": metrics["trades"],
+                "勝率": metrics["win_rate"],
+                "合計R": metrics["total_r"],
+                "平均R": metrics["average_r"],
+                "PF": pf_label(float(metrics["profit_factor"])),
+                "最大DD": metrics["max_drawdown_r"],
+            }
+        )
+    return metrics_frame(rows)
+
+
+def split_trades_for_walk_forward(trades: list[BacktestTrade], train_ratio: float = 0.7) -> tuple[list[BacktestTrade], list[BacktestTrade]]:
+    ordered = sorted(trades, key=lambda trade: comparable_timestamp(trade.signal_time))
+    if len(ordered) < 2:
+        return ordered, []
+    split_at = min(len(ordered) - 1, max(1, int(len(ordered) * train_ratio)))
+    return ordered[:split_at], ordered[split_at:]
+
+
+def walk_forward_frame(trades: list[BacktestTrade]) -> pd.DataFrame:
+    train, test = split_trades_for_walk_forward(trades)
+    rows = []
+    for label, segment in [("過去最適化側", train), ("未使用期間側", test)]:
+        metrics = trade_metrics(segment)
+        rows.append(
+            {
+                "区分": label,
+                "取引数": metrics["trades"],
+                "勝率": metrics["win_rate"],
+                "合計R": metrics["total_r"],
+                "平均R": metrics["average_r"],
+                "PF": pf_label(float(metrics["profit_factor"])),
+                "最大DD": metrics["max_drawdown_r"],
+            }
+        )
+    return metrics_frame(rows)
+
+
+@st.cache_data(ttl=15 * 60, show_spinner=False)
+def compare_backtest_settings(
+    period: str,
+    scenarios: tuple[tuple[int, int, str], ...],
+    entry_mode: str,
+    expire_bars: int,
+    step_bars: int,
+    spread_pips: float,
+    slippage_pips: float,
+) -> pd.DataFrame:
+    rows = []
+    for threshold, hold_bars, target_choice in scenarios:
+        result = run_backtest(
+            period,
+            int(threshold),
+            entry_mode,
+            int(expire_bars),
+            int(hold_bars),
+            target_choice,
+            int(step_bars),
+            float(spread_pips),
+            float(slippage_pips),
+        )
+        train, test = split_trades_for_walk_forward(result.trades)
+        train_metrics = trade_metrics(train)
+        test_metrics = trade_metrics(test)
+        train_score = float(train_metrics["average_r"]) * min(int(train_metrics["trades"]), 30)
+        rows.append(
+            {
+                "信頼度": threshold,
+                "利確": "第2利確" if target_choice == "target_2" else "第1利確",
+                "最大保有": hold_bars,
+                "前半取引": train_metrics["trades"],
+                "前半合計R": train_metrics["total_r"],
+                "前半平均R": train_metrics["average_r"],
+                "前半PF": pf_label(float(train_metrics["profit_factor"])),
+                "後半取引": test_metrics["trades"],
+                "後半合計R": test_metrics["total_r"],
+                "後半平均R": test_metrics["average_r"],
+                "後半PF": pf_label(float(test_metrics["profit_factor"])),
+                "前半評価": train_score,
+            }
+        )
+    frame = pd.DataFrame(rows)
+    if frame.empty:
+        return frame
+    for column in ["前半合計R", "前半平均R", "後半合計R", "後半平均R", "前半評価"]:
+        frame[column] = frame[column].astype(float).round(2)
+    return frame.sort_values(["前半評価", "後半平均R"], ascending=False).reset_index(drop=True)
+
+
 def render_backtest_section(default_threshold: int) -> None:
     st.subheader("バックテスト")
     st.caption("過去データの各時点で判定を作り直し、候補ゾーン到達後の利確/損切りを検証します。未来の価格は判定に使いません。")
     c1, c2, c3, c4 = st.columns(4)
     with c1:
-        period = st.selectbox("検証期間", ["90d", "180d", "365d", "730d"], index=0)
+        period = st.selectbox(
+            "検証期間",
+            ["90d", "180d", "365d", "730d"],
+            index=0,
+            help="どれくらい過去までさかのぼって検証するかです。長いほど参考材料は増えますが、相場環境が古くなる点に注意します。",
+        )
     with c2:
-        threshold = st.slider("検証する信頼度", 50, 90, int(default_threshold), 1)
+        threshold = st.slider(
+            "検証する信頼度",
+            50,
+            90,
+            int(default_threshold),
+            1,
+            help="この点数以上のシグナルだけを取引した場合の成績を見ます。高くすると質は上がりやすい一方、取引数は減ります。",
+        )
     with c3:
-        target_choice_label = st.selectbox("利確", ["第1利確", "第2利確"], index=0)
+        target_choice_label = st.selectbox(
+            "利確",
+            ["第1利確", "第2利確"],
+            index=0,
+            help="第1利確は近め、第2利確は遠めの利益目標です。遠いほど勝率は下がりやすく、勝った時のRは大きくなります。",
+        )
     with c4:
-        entry_mode_label = st.selectbox("エントリー", ["候補ゾーン到達", "次の足の始値"], index=0)
+        entry_mode_label = st.selectbox(
+            "エントリー",
+            ["候補ゾーン到達", "次の足の始値"],
+            index=0,
+            help="候補ゾーン到達は指値に近い考え方、次の足の始値は通知後すぐ入る考え方です。",
+        )
 
-    c5, c6, c7 = st.columns(3)
+    c5, c6, c7, c8, c9 = st.columns(5)
     with c5:
-        expire_bars = st.number_input("候補ゾーン待ち時間", min_value=1, max_value=48, value=12, step=1)
+        expire_bars = st.number_input(
+            "候補ゾーン待ち時間",
+            min_value=1,
+            max_value=48,
+            value=12,
+            step=1,
+            help="通知後、何時間以内に候補価格まで来たら取引した扱いにするかです。",
+        )
     with c6:
-        max_hold_bars = st.number_input("最大保有時間", min_value=4, max_value=120, value=48, step=4)
+        max_hold_bars = st.number_input(
+            "最大保有時間",
+            min_value=4,
+            max_value=120,
+            value=48,
+            step=4,
+            help="利確にも損切りにも届かなかった時、最大で何時間持つかです。",
+        )
     with c7:
-        step_bars = st.number_input("判定間隔", min_value=1, max_value=12, value=4, step=1)
+        step_bars = st.number_input(
+            "判定間隔",
+            min_value=1,
+            max_value=12,
+            value=4,
+            step=1,
+            help="過去チャート上で何時間ごとにシグナル判定を作るかです。小さいほど細かく見ますが重くなります。",
+        )
+    with c8:
+        spread_pips = st.number_input(
+            "スプレッド",
+            min_value=0.0,
+            max_value=5.0,
+            value=0.2,
+            step=0.1,
+            help="売値と買値の差です。実戦ではここがコストになり、バックテスト成績を下げます。",
+        )
+    with c9:
+        slippage_pips = st.number_input(
+            "滑り",
+            min_value=0.0,
+            max_value=5.0,
+            value=0.1,
+            step=0.1,
+            help="注文した価格から少しずれて約定する想定コストです。急変時ほど大きくなりやすいです。",
+        )
 
     entry_mode = "next_open" if entry_mode_label == "次の足の始値" else "candidate_zone"
     target_choice = "target_2" if target_choice_label == "第2利確" else "target_1"
     with st.spinner("バックテスト中..."):
-        result = run_backtest(period, threshold, entry_mode, int(expire_bars), int(max_hold_bars), target_choice, int(step_bars))
+        result = run_backtest(
+            period,
+            threshold,
+            entry_mode,
+            int(expire_bars),
+            int(max_hold_bars),
+            target_choice,
+            int(step_bars),
+            float(spread_pips),
+            float(slippage_pips),
+        )
 
     m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric("取引数", len(result.trades))
-    m2.metric("勝率", f"{result.win_rate:.1f}%")
-    m3.metric("合計R", f"{result.total_r:.2f}")
-    m4.metric("平均R", f"{result.average_r:.2f}")
-    m5.metric("最大DD", f"{result.max_drawdown_r:.2f}R")
+    m1.metric("取引数", len(result.trades), help="条件を満たして実際にエントリー扱いになった回数です。")
+    m2.metric("勝率", f"{result.win_rate:.1f}%", help="利益で終わった取引の割合です。勝率だけでなく平均Rも一緒に見ます。")
+    m3.metric("合計R", f"{result.total_r:.2f}", help="1回の損切り幅を1Rとして、合計で何R増減したかです。")
+    m4.metric("平均R", f"{result.average_r:.2f}", help="1取引あたり平均で何R取れたかです。プラスが大きいほど期待値が高いです。")
+    m5.metric("最大DD", f"{result.max_drawdown_r:.2f}R", help="過去検証中の最大の落ち込みです。資金管理のきつさを見る指標です。")
 
     m6, m7, m8 = st.columns(3)
-    pf_text = "∞" if np.isinf(result.profit_factor) else f"{result.profit_factor:.2f}"
-    m6.metric("PF", pf_text)
-    m7.metric("最大連敗", result.max_losing_streak)
-    m8.metric("未約定/除外", result.skipped_signals)
+    m6.metric("PF", pf_label(result.profit_factor), help="総利益を総損失で割った指標です。1.0超で利益優勢、1.3以上なら少し見込みが出ます。")
+    m7.metric("最大連敗", result.max_losing_streak, help="検証期間内で連続して負けた最大回数です。")
+    m8.metric("未約定/除外", result.skipped_signals, help="候補ゾーンに届かなかった、または計算条件を満たさなかったシグナル数です。")
     st.caption(f"判定した過去シグナル数: {result.checked_signals}")
 
     if result.suggested_threshold is not None:
@@ -1520,8 +1774,69 @@ def render_backtest_section(default_threshold: int) -> None:
 
     st.plotly_chart(backtest_equity_figure(result.trades), use_container_width=True)
     frame = backtest_trades_frame(result.trades)
-    if not frame.empty:
-        st.dataframe(frame.sort_values("entry_time", ascending=False), use_container_width=True, hide_index=True)
+    with st.expander("詳細診断", expanded=False):
+        if frame.empty:
+            st.caption("表示できる取引がまだありません。")
+            return
+
+        side_tab, regime_tab, session_tab, wf_tab, compare_tab, trades_tab = st.tabs(
+            ["買い/売り", "トレンド/レンジ", "時間帯", "未使用期間", "設定比較", "取引一覧"]
+        )
+        with side_tab:
+            st.caption("買いと売りを分け、どちらが得意かを見ます。弱い側は通知条件を厳しくする候補です。")
+            st.dataframe(
+                grouped_backtest_frame(result.trades, "方向", lambda trade: "買い" if trade.side == "buy" else "売り"),
+                use_container_width=True,
+                hide_index=True,
+            )
+        with regime_tab:
+            st.caption("相場がトレンドかレンジかで分けます。順張り/逆張りの向き不向きを探します。")
+            st.dataframe(
+                grouped_backtest_frame(result.trades, "相場環境", lambda trade: trade.regime_group),
+                use_container_width=True,
+                hide_index=True,
+            )
+        with session_tab:
+            st.caption("エントリー時間を東京・ロンドン・NY・薄商いに分けます。弱い時間帯を避ける判断材料です。")
+            st.dataframe(
+                grouped_backtest_frame(result.trades, "時間帯", lambda trade: trade.session),
+                use_container_width=True,
+                hide_index=True,
+            )
+        with wf_tab:
+            st.caption("前半を過去最適化側、後半を未使用期間側として分けます。後半で崩れる設定は実戦向きではありません。")
+            st.dataframe(walk_forward_frame(result.trades), use_container_width=True, hide_index=True)
+        with compare_tab:
+            st.caption("今の設定の近くで、信頼度・利確・最大保有時間を自動比較します。前半で良かった順に並べ、後半でも崩れていないかを見ます。")
+            if st.button("設定比較を実行", use_container_width=True):
+                alt_target = "target_1" if target_choice == "target_2" else "target_2"
+                scenarios = tuple(
+                    sorted(
+                        {
+                            (max(50, int(threshold) - 5), int(max_hold_bars), target_choice),
+                            (int(threshold), int(max_hold_bars), target_choice),
+                            (min(90, int(threshold) + 5), int(max_hold_bars), target_choice),
+                            (int(threshold), int(max_hold_bars), alt_target),
+                            (int(threshold), max(4, int(max_hold_bars) - 24), target_choice),
+                            (int(threshold), min(120, int(max_hold_bars) + 24), target_choice),
+                        }
+                    )
+                )
+                with st.spinner("設定を比較中..."):
+                    comparison = compare_backtest_settings(
+                        period,
+                        scenarios,
+                        entry_mode,
+                        int(expire_bars),
+                        max(4, int(step_bars)),
+                        float(spread_pips),
+                        float(slippage_pips),
+                    )
+                st.dataframe(comparison.head(20), use_container_width=True, hide_index=True)
+            else:
+                st.caption("重めの処理なので、必要な時だけ実行します。")
+        with trades_tab:
+            st.dataframe(frame.sort_values("entry_time", ascending=False), use_container_width=True, hide_index=True)
 
 
 def analyze_market() -> AnalysisResult:
