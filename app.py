@@ -107,6 +107,36 @@ class AnalysisResult:
     latest_time: object
 
 
+@dataclass
+class BacktestTrade:
+    signal_time: object
+    entry_time: object
+    exit_time: object
+    side: str
+    score: int
+    entry: float
+    stop: float
+    target: float
+    exit_price: float
+    result: str
+    pips: float
+    r_multiple: float
+
+
+@dataclass
+class BacktestResult:
+    trades: list[BacktestTrade]
+    skipped_signals: int
+    checked_signals: int
+    win_rate: float
+    total_r: float
+    average_r: float
+    profit_factor: float
+    max_drawdown_r: float
+    max_losing_streak: int
+    suggested_threshold: int | None
+
+
 st.set_page_config(
     page_title="USD/JPY Signal Desk",
     page_icon="FX",
@@ -189,6 +219,29 @@ def fetch_prices(ticker: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     return clean_download(hourly), clean_download(daily)
 
 
+@st.cache_data(ttl=15 * 60, show_spinner=False)
+def fetch_backtest_prices(ticker: str, period: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    hourly = yf.download(
+        ticker,
+        period=period,
+        interval="60m",
+        progress=False,
+        auto_adjust=False,
+        prepost=True,
+        threads=False,
+    )
+    daily = yf.download(
+        ticker,
+        period="2y",
+        interval="1d",
+        progress=False,
+        auto_adjust=False,
+        prepost=True,
+        threads=False,
+    )
+    return clean_download(hourly), clean_download(daily)
+
+
 def parse_float(text: str | None) -> float | None:
     if text is None or text == "":
         return None
@@ -240,7 +293,7 @@ def fetch_treasury_yields() -> pd.DataFrame:
     return data.reset_index(drop=True)
 
 
-def build_macro_context(yields: pd.DataFrame) -> MacroContext:
+def build_macro_context(yields: pd.DataFrame, current_date: date | None = None) -> MacroContext:
     if yields.empty or len(yields) < 25:
         return MacroContext(
             name="米金利データなし",
@@ -291,7 +344,8 @@ def build_macro_context(yields: pd.DataFrame) -> MacroContext:
     else:
         reasons.append("米10年債利回りは明確な追い風/向かい風なし")
 
-    if isinstance(last_date, date) and (datetime.now(JST).date() - last_date).days >= 7:
+    reference_date = current_date or datetime.now(JST).date()
+    if isinstance(last_date, date) and (reference_date - last_date).days >= 7:
         warnings.append("米金利データの最終日が古いため、参考度は低め")
 
     return MacroContext(
@@ -651,8 +705,7 @@ def fetch_policy_events() -> list[EventItem]:
     return sorted(unique.values(), key=lambda item: item.event_date)
 
 
-def build_event_risk(events: list[EventItem]) -> EventRisk:
-    now = datetime.now(JST)
+def build_event_risk_at(events: list[EventItem], now: datetime) -> EventRisk:
     today = now.date()
     future = [event for event in events if event.event_date >= today - timedelta(days=1)]
     next_events = [event for event in future if event.event_date >= today][:5]
@@ -699,6 +752,10 @@ def build_event_risk(events: list[EventItem]) -> EventRisk:
         next_events=next_events,
         warnings=warnings,
     )
+
+
+def build_event_risk(events: list[EventItem]) -> EventRisk:
+    return build_event_risk_at(events, datetime.now(JST))
 
 
 def build_setup(
@@ -1099,6 +1156,354 @@ def build_notification_message(result: AnalysisResult) -> tuple[str, str]:
     return title, message
 
 
+def comparable_timestamp(value: object) -> pd.Timestamp:
+    ts = pd.Timestamp(value)
+    if ts.tzinfo is not None:
+        return ts.tz_convert("UTC").tz_localize(None)
+    return ts
+
+
+def slice_until(data: pd.DataFrame, current_time: object) -> pd.DataFrame:
+    if data.empty:
+        return data
+    target = comparable_timestamp(current_time)
+    index = pd.DatetimeIndex(data.index)
+    if index.tz is not None:
+        comparable_index = index.tz_convert("UTC").tz_localize(None)
+    else:
+        comparable_index = index
+    return data.loc[comparable_index <= target]
+
+
+def datetime_for_event_check(value: object) -> datetime:
+    ts = pd.Timestamp(value)
+    if ts.tzinfo is None:
+        return ts.to_pydatetime().replace(tzinfo=JST)
+    return ts.tz_convert(JST).to_pydatetime()
+
+
+def yields_until(yields: pd.DataFrame, current_day: date) -> pd.DataFrame:
+    if yields.empty or "date" not in yields.columns:
+        return pd.DataFrame(columns=["date", "2Y", "10Y"])
+    return yields[yields["date"] <= current_day].copy()
+
+
+def evaluate_trade_exit(
+    future: pd.DataFrame,
+    side: str,
+    entry: float,
+    stop: float,
+    target: float,
+    max_hold_bars: int,
+) -> tuple[object, float, str]:
+    hold = future.head(max_hold_bars)
+    if hold.empty:
+        return None, entry, "no_data"
+
+    for bar_time, bar in hold.iterrows():
+        high = float(bar["High"])
+        low = float(bar["Low"])
+        if side == "buy":
+            stop_hit = low <= stop
+            target_hit = high >= target
+            if stop_hit and target_hit:
+                return bar_time, stop, "loss"
+            if target_hit:
+                return bar_time, target, "win"
+            if stop_hit:
+                return bar_time, stop, "loss"
+        else:
+            stop_hit = high >= stop
+            target_hit = low <= target
+            if stop_hit and target_hit:
+                return bar_time, stop, "loss"
+            if target_hit:
+                return bar_time, target, "win"
+            if stop_hit:
+                return bar_time, stop, "loss"
+
+    last_time = hold.index[-1]
+    last_close = float(hold.iloc[-1]["Close"])
+    return last_time, last_close, "timeout"
+
+
+def find_entry(
+    future: pd.DataFrame,
+    setup: Setup,
+    mode: str,
+    expire_bars: int,
+) -> tuple[object, float, pd.DataFrame] | None:
+    if future.empty:
+        return None
+    if mode == "next_open":
+        entry_time = future.index[0]
+        entry_price = float(future.iloc[0]["Open"])
+        return entry_time, entry_price, future
+
+    entry_price = (setup.entry_low + setup.entry_high) / 2
+    search = future.head(expire_bars)
+    for entry_time, bar in search.iterrows():
+        if float(bar["Low"]) <= entry_price <= float(bar["High"]):
+            return entry_time, float(entry_price), future.loc[entry_time:]
+    return None
+
+
+def summarize_backtest(trades: list[BacktestTrade], checked: int, skipped: int) -> BacktestResult:
+    if not trades:
+        return BacktestResult(
+            trades=[],
+            skipped_signals=skipped,
+            checked_signals=checked,
+            win_rate=0.0,
+            total_r=0.0,
+            average_r=0.0,
+            profit_factor=0.0,
+            max_drawdown_r=0.0,
+            max_losing_streak=0,
+            suggested_threshold=None,
+        )
+
+    r_values = [trade.r_multiple for trade in trades]
+    wins = [value for value in r_values if value > 0]
+    losses = [value for value in r_values if value < 0]
+    equity = np.cumsum(r_values)
+    peak = np.maximum.accumulate(equity)
+    drawdown = equity - peak
+    losing_streak = 0
+    max_losing_streak = 0
+    for value in r_values:
+        if value < 0:
+            losing_streak += 1
+            max_losing_streak = max(max_losing_streak, losing_streak)
+        else:
+            losing_streak = 0
+
+    suggested_threshold = None
+    best_score = -999.0
+    for threshold in [60, 65, 68, 70, 72, 75, 78, 80]:
+        filtered = [trade.r_multiple for trade in trades if trade.score >= threshold]
+        if len(filtered) < 5:
+            continue
+        score = float(np.mean(filtered)) * min(len(filtered), 25)
+        if score > best_score:
+            best_score = score
+            suggested_threshold = threshold
+
+    return BacktestResult(
+        trades=trades,
+        skipped_signals=skipped,
+        checked_signals=checked,
+        win_rate=len(wins) / len(trades) * 100,
+        total_r=float(np.sum(r_values)),
+        average_r=float(np.mean(r_values)),
+        profit_factor=float(np.sum(wins) / abs(np.sum(losses))) if losses else float("inf"),
+        max_drawdown_r=abs(float(drawdown.min())) if len(drawdown) else 0.0,
+        max_losing_streak=max_losing_streak,
+        suggested_threshold=suggested_threshold,
+    )
+
+
+@st.cache_data(ttl=15 * 60, show_spinner=False)
+def run_backtest(
+    period: str,
+    threshold: int,
+    entry_mode: str,
+    expire_bars: int,
+    max_hold_bars: int,
+    target_choice: str,
+    step_bars: int,
+) -> BacktestResult:
+    hourly_raw, daily_raw = fetch_backtest_prices(TICKER, period)
+    if hourly_raw.empty or daily_raw.empty:
+        return summarize_backtest([], 0, 0)
+
+    hourly = with_indicators(hourly_raw)
+    daily = with_indicators(daily_raw)
+    try:
+        treasury = fetch_treasury_yields()
+    except Exception:
+        treasury = pd.DataFrame(columns=["date", "2Y", "10Y"])
+    events = fetch_policy_events()
+
+    config = {
+        "score_threshold": threshold,
+        "notify_during_high_event": False,
+    }
+    trades: list[BacktestTrade] = []
+    checked = 0
+    skipped = 0
+    next_allowed_position = 0
+
+    for position in range(80, len(hourly) - max_hold_bars - 1, max(1, step_bars)):
+        if position < next_allowed_position:
+            continue
+        current_time = hourly.index[position]
+        hourly_slice = hourly.iloc[: position + 1]
+        h4_slice = with_indicators(to_4h(hourly_raw.loc[:current_time]))
+        daily_slice = slice_until(daily, current_time)
+        if len(hourly_slice) < 80 or len(h4_slice) < 40 or len(daily_slice) < 80:
+            continue
+
+        current_dt = datetime_for_event_check(current_time)
+        regime = analyze_regime(h4_slice)
+        macro = build_macro_context(yields_until(treasury, current_dt.date()), current_dt.date())
+        event_risk = build_event_risk_at(events, current_dt)
+        setup = build_setup(PAIR, hourly_slice, h4_slice, daily_slice, regime, macro, event_risk)
+        checked += 1
+        ok, _ = is_entry_chance(setup, event_risk, config)
+        if not ok:
+            continue
+
+        target = setup.target_2 if target_choice == "target_2" else setup.target_1
+        if not all(np.isfinite(value) for value in [setup.stop, target, setup.entry_low, setup.entry_high]):
+            skipped += 1
+            continue
+
+        future = hourly.iloc[position + 1 :]
+        entry = find_entry(future, setup, entry_mode, expire_bars)
+        if entry is None:
+            skipped += 1
+            continue
+        entry_time, entry_price, future_after_entry = entry
+        risk = abs(entry_price - setup.stop)
+        if risk <= 0:
+            skipped += 1
+            continue
+
+        exit_time, exit_price, result = evaluate_trade_exit(
+            future_after_entry,
+            setup.bias,
+            entry_price,
+            setup.stop,
+            target,
+            max_hold_bars,
+        )
+        if exit_time is None:
+            skipped += 1
+            continue
+
+        raw_profit = exit_price - entry_price if setup.bias == "buy" else entry_price - exit_price
+        pips = raw_profit * 100
+        r_multiple = raw_profit / risk
+        trades.append(
+            BacktestTrade(
+                signal_time=current_time,
+                entry_time=entry_time,
+                exit_time=exit_time,
+                side=setup.bias,
+                score=setup.score,
+                entry=float(entry_price),
+                stop=float(setup.stop),
+                target=float(target),
+                exit_price=float(exit_price),
+                result=result,
+                pips=float(pips),
+                r_multiple=float(r_multiple),
+            )
+        )
+        next_allowed_position = min(len(hourly), position + max_hold_bars)
+
+    return summarize_backtest(trades, checked, skipped)
+
+
+def backtest_trades_frame(trades: list[BacktestTrade]) -> pd.DataFrame:
+    rows = []
+    for trade in trades:
+        rows.append(
+            {
+                "signal_time": trade.signal_time,
+                "entry_time": trade.entry_time,
+                "exit_time": trade.exit_time,
+                "side": "買い" if trade.side == "buy" else "売り",
+                "score": trade.score,
+                "entry": round(trade.entry, 3),
+                "stop": round(trade.stop, 3),
+                "target": round(trade.target, 3),
+                "exit": round(trade.exit_price, 3),
+                "result": trade.result,
+                "pips": round(trade.pips, 1),
+                "R": round(trade.r_multiple, 2),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def backtest_equity_figure(trades: list[BacktestTrade]) -> go.Figure:
+    if not trades:
+        return go.Figure()
+    frame = backtest_trades_frame(trades)
+    frame["equity_r"] = frame["R"].cumsum()
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=frame["exit_time"],
+            y=frame["equity_r"],
+            mode="lines+markers",
+            name="Cumulative R",
+            line=dict(color="#1f77b4", width=2),
+        )
+    )
+    fig.update_layout(
+        height=360,
+        margin=dict(l=10, r=10, t=24, b=10),
+        paper_bgcolor="#ffffff",
+        plot_bgcolor="#ffffff",
+        yaxis=dict(title="Cumulative R"),
+    )
+    return fig
+
+
+def render_backtest_section(default_threshold: int) -> None:
+    st.subheader("バックテスト")
+    st.caption("過去データの各時点で判定を作り直し、候補ゾーン到達後の利確/損切りを検証します。未来の価格は判定に使いません。")
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        period = st.selectbox("検証期間", ["90d", "180d", "365d", "730d"], index=0)
+    with c2:
+        threshold = st.slider("検証する信頼度", 50, 90, int(default_threshold), 1)
+    with c3:
+        target_choice_label = st.selectbox("利確", ["第1利確", "第2利確"], index=0)
+    with c4:
+        entry_mode_label = st.selectbox("エントリー", ["候補ゾーン到達", "次の足の始値"], index=0)
+
+    c5, c6, c7 = st.columns(3)
+    with c5:
+        expire_bars = st.number_input("候補ゾーン待ち時間", min_value=1, max_value=48, value=12, step=1)
+    with c6:
+        max_hold_bars = st.number_input("最大保有時間", min_value=4, max_value=120, value=48, step=4)
+    with c7:
+        step_bars = st.number_input("判定間隔", min_value=1, max_value=12, value=4, step=1)
+
+    entry_mode = "next_open" if entry_mode_label == "次の足の始値" else "candidate_zone"
+    target_choice = "target_2" if target_choice_label == "第2利確" else "target_1"
+    with st.spinner("バックテスト中..."):
+        result = run_backtest(period, threshold, entry_mode, int(expire_bars), int(max_hold_bars), target_choice, int(step_bars))
+
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("取引数", len(result.trades))
+    m2.metric("勝率", f"{result.win_rate:.1f}%")
+    m3.metric("合計R", f"{result.total_r:.2f}")
+    m4.metric("平均R", f"{result.average_r:.2f}")
+    m5.metric("最大DD", f"{result.max_drawdown_r:.2f}R")
+
+    m6, m7, m8 = st.columns(3)
+    pf_text = "∞" if np.isinf(result.profit_factor) else f"{result.profit_factor:.2f}"
+    m6.metric("PF", pf_text)
+    m7.metric("最大連敗", result.max_losing_streak)
+    m8.metric("未約定/除外", result.skipped_signals)
+    st.caption(f"判定した過去シグナル数: {result.checked_signals}")
+
+    if result.suggested_threshold is not None:
+        st.info(f"この期間だけで見ると、信頼度 {result.suggested_threshold}% 以上が比較的よさそうです。ただし過去に合わせすぎる危険があるので、すぐ自動変更せず目安として見てください。")
+    elif len(result.trades) < 5:
+        st.warning("取引数が少ないため、勝率や推奨しきい値はまだ判断材料として弱いです。")
+
+    st.plotly_chart(backtest_equity_figure(result.trades), use_container_width=True)
+    frame = backtest_trades_frame(result.trades)
+    if not frame.empty:
+        st.dataframe(frame.sort_values("entry_time", ascending=False), use_container_width=True, hide_index=True)
+
+
 def analyze_market() -> AnalysisResult:
     hourly_raw, daily_raw = fetch_prices(TICKER)
     if hourly_raw.empty or daily_raw.empty:
@@ -1304,6 +1709,9 @@ def main() -> None:
             st.subheader("次の重要イベント")
             for event in event_risk.next_events[:4]:
                 st.markdown(f"- {event.event_date:%Y-%m-%d}: {event.title}")
+
+    st.divider()
+    render_backtest_section(int(notification_config.get("score_threshold", 68)))
 
 
 if __name__ == "__main__":
