@@ -17,6 +17,8 @@ import streamlit as st
 import yfinance as yf
 from bs4 import BeautifulSoup
 
+from fx_filters import LiveFilterDecision, LiveFilterEngine, LiveFilterSnapshot
+
 
 PAIR = "USD/JPY"
 TICKER = "JPY=X"
@@ -1043,6 +1045,7 @@ def default_notification_config() -> dict[str, object]:
         "score_threshold": 68,
         "candidate_score_threshold": 50,
         "daily_summary_hour": 8,
+        "live_filter_enabled": True,
         "interval_minutes": 15,
         "cooldown_minutes": 180,
         "notify_during_high_event": False,
@@ -1154,11 +1157,67 @@ def notification_kind(setup: Setup, event_risk: EventRisk, config: dict[str, obj
     return "none", f"候補条件未満 ({setup.score}% < {candidate_threshold}%)"
 
 
+def setup_risk_reward(setup: Setup) -> float | None:
+    if setup.bias not in {"buy", "sell"}:
+        return None
+    values = [setup.entry_low, setup.entry_high, setup.stop, setup.target_1]
+    if not all(np.isfinite(value) for value in values):
+        return None
+    entry = (setup.entry_low + setup.entry_high) / 2
+    risk = abs(entry - setup.stop)
+    if risk <= 0:
+        return None
+    reward = setup.target_1 - entry if setup.bias == "buy" else entry - setup.target_1
+    return max(0.0, reward / risk)
+
+
+def live_filter_snapshot(result: AnalysisResult) -> LiveFilterSnapshot:
+    return LiveFilterSnapshot(
+        bias=result.setup.bias,
+        score=result.setup.score,
+        regime_name=result.regime.name,
+        regime_bias=result.regime.bias,
+        regime_group=regime_group_name(result.regime.name),
+        session=session_name(result.latest_time),
+        macro_bias=result.macro.bias,
+        event_level=result.event_risk.level,
+        risk_reward=setup_risk_reward(result.setup),
+        warning_count=len(result.setup.warnings) + len(result.regime.warnings) + len(result.macro.warnings),
+    )
+
+
+def live_filter_decision(result: AnalysisResult, config: dict[str, object]) -> LiveFilterDecision:
+    return LiveFilterEngine().decide(live_filter_snapshot(result), config)
+
+
+def notification_decision(result: AnalysisResult, config: dict[str, object]) -> tuple[str, str, LiveFilterDecision]:
+    if not bool(config.get("live_filter_enabled", True)):
+        kind, reason = notification_kind(result.setup, result.event_risk, config)
+        return (
+            kind,
+            reason,
+            LiveFilterDecision(
+                kind=kind,
+                label="従来判定",
+                reason=reason,
+                effective_score=result.setup.score,
+                main_threshold=int(config.get("score_threshold", 68)),
+                candidate_threshold=int(config.get("candidate_score_threshold", 50)),
+            ),
+        )
+    decision = live_filter_decision(result, config)
+    return decision.kind, decision.reason, decision
+
+
 def signal_key(setup: Setup) -> str:
     return setup.bias
 
 
-def build_notification_message(result: AnalysisResult, kind: str = "main") -> tuple[str, str]:
+def build_notification_message(
+    result: AnalysisResult,
+    kind: str = "main",
+    decision: LiveFilterDecision | None = None,
+) -> tuple[str, str]:
     setup = result.setup
     side = {"buy": "BUY", "sell": "SELL", "wait": "WAIT"}.get(setup.bias, "WAIT")
     kind_title = {"main": "MAIN", "candidate": "CANDIDATE", "daily": "DAILY"}.get(kind, "SIGNAL")
@@ -1167,6 +1226,10 @@ def build_notification_message(result: AnalysisResult, kind: str = "main") -> tu
     stop = "未設定" if setup.bias == "wait" else fmt_price(setup.stop, PAIR)
     target = "未設定" if setup.bias == "wait" else f"{fmt_price(setup.target_1, PAIR)} / {fmt_price(setup.target_2, PAIR)}"
     reasons = " / ".join(setup.reasons[:3])
+    filter_lines = ""
+    if decision is not None:
+        notes = " / ".join(decision.notes[:2]) if decision.notes else "追加警戒なし"
+        filter_lines = f"\n実戦フィルター: {decision.label} / {decision.reason}\n補足: {notes}"
     message = (
         f"{kind_label}\n"
         f"{setup.direction}\n"
@@ -1177,6 +1240,7 @@ def build_notification_message(result: AnalysisResult, kind: str = "main") -> tu
         f"相場環境: {result.regime.name}\n"
         f"米金利: {result.macro.name}\n"
         f"根拠: {reasons}"
+        f"{filter_lines}"
     )
     return title, message
 
@@ -1938,6 +2002,11 @@ def main() -> None:
                 "重要イベント前後も通知する",
                 value=bool(notification_config.get("notify_during_high_event", False)),
             )
+            notification_config["live_filter_enabled"] = st.checkbox(
+                "実戦フィルターを使う",
+                value=bool(notification_config.get("live_filter_enabled", True)),
+                help="方向・相場環境・時間帯・金利・イベント・リスクリワードを見て、本命/候補/見送りを通知直前に調整します。",
+            )
             save_notification_config(notification_config)
             topic = str(notification_config["topic"])
             st.markdown(f"[スマホ購読リンク]({notification_subscribe_url(topic)})")
@@ -1969,6 +2038,7 @@ def main() -> None:
     setup = result.setup
     current_price = result.current_price
     latest_time = result.latest_time
+    filter_decision = live_filter_decision(result, notification_config)
     now_jst = datetime.now(JST).strftime("%Y-%m-%d %H:%M")
 
     st.title("USD/JPY Signal Desk")
@@ -1998,7 +2068,7 @@ def main() -> None:
         box("利確候補", target_text, "リスクリワードから算出")
 
     st.subheader("追加フィルター")
-    f1, f2, f3 = st.columns(3)
+    f1, f2, f3, f4 = st.columns(4)
     with f1:
         box(
             "相場環境",
@@ -2015,6 +2085,9 @@ def main() -> None:
     with f3:
         event_note = " / ".join(event_risk.items[:2]) if event_risk.items else "近い重要イベントは検出なし"
         box("イベント注意", event_risk.title, event_note)
+    with f4:
+        filter_note = " / ".join(filter_decision.notes[:2]) if filter_decision.notes else filter_decision.reason
+        box("実戦フィルター", filter_decision.label, filter_note)
 
     info_left, info_right = st.columns([1, 1])
     with info_left:

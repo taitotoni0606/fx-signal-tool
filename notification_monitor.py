@@ -60,11 +60,16 @@ def run_check() -> None:
         log("skip: ntfy topic missing")
         return
 
-    kind, reason = app.notification_kind(setup, result.event_risk, config)
+    kind, reason, decision = app.notification_decision(result, config)
     today = now.date().isoformat()
+    state["last_filter_label"] = decision.label
+    state["last_filter_reason"] = decision.reason
+    state["last_filter_notes"] = list(decision.notes)
+    state["last_filter_main_threshold"] = decision.main_threshold
+    state["last_filter_candidate_threshold"] = decision.candidate_threshold
 
     def send(kind_name: str, priority: str = "default") -> None:
-        title, message = app.build_notification_message(result, kind_name)
+        title, message = app.build_notification_message(result, kind_name, decision)
         app.send_ntfy_notification(topic, title, message, priority=priority)
         state.update(
             {

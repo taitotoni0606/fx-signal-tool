@@ -39,6 +39,7 @@ def github_config() -> dict[str, object]:
         "score_threshold": int(os.getenv("SCORE_THRESHOLD", "68")),
         "candidate_score_threshold": int(os.getenv("CANDIDATE_SCORE_THRESHOLD", "50")),
         "daily_summary_hour": int(os.getenv("DAILY_SUMMARY_HOUR", "8")),
+        "live_filter_enabled": env_bool("LIVE_FILTER_ENABLED", True),
         "cooldown_minutes": int(os.getenv("COOLDOWN_MINUTES", "180")),
         "notify_during_high_event": env_bool("NOTIFY_DURING_HIGH_EVENT", False),
         "dashboard_url": normalize_url(os.getenv("DASHBOARD_URL", default_dashboard_url())),
@@ -152,6 +153,11 @@ def generate_dashboard(result: app.AnalysisResult, state: dict[str, object], out
         for event in result.event_risk.next_events[:5]
     )
     last_status = state.get("last_status", "未実行")
+    filter_label = str(state.get("last_filter_label", "未評価"))
+    filter_reason = str(state.get("last_filter_reason", ""))
+    filter_notes_raw = state.get("last_filter_notes", [])
+    filter_notes = " / ".join(str(note) for note in filter_notes_raw[:2]) if isinstance(filter_notes_raw, list) else ""
+    filter_note = filter_notes or filter_reason
 
     content = f"""<!doctype html>
 <html lang="ja">
@@ -300,10 +306,11 @@ def generate_dashboard(result: app.AnalysisResult, state: dict[str, object], out
       {metric("通知状態", str(last_status))}
     </div>
 
-    <div class="grid three">
+    <div class="grid four">
       {metric("相場環境", result.regime.name, f"ADX {result.regime.adx:.1f} / BB幅順位 {result.regime.bb_rank:.0f}%")}
       {metric("米金利", result.macro.name, f"10Y {result.macro.ten_year:.2f}%" if result.macro.ten_year is not None else "未取得")}
       {metric("イベント注意", result.event_risk.title, " / ".join(result.event_risk.items[:2]) if result.event_risk.items else "近い重要イベントなし")}
+      {metric("実戦フィルター", filter_label, filter_note)}
     </div>
 
     <section class="card">
@@ -344,12 +351,17 @@ def maybe_notify(result: app.AnalysisResult, state_path: Path) -> dict[str, obje
         write_json(state_path, state)
         return state
 
-    kind, reason = app.notification_kind(result.setup, result.event_risk, config)
+    kind, reason, decision = app.notification_decision(result, config)
     today = now.date().isoformat()
     dashboard_url = str(config.get("dashboard_url", ""))
+    state["last_filter_label"] = decision.label
+    state["last_filter_reason"] = decision.reason
+    state["last_filter_notes"] = list(decision.notes)
+    state["last_filter_main_threshold"] = decision.main_threshold
+    state["last_filter_candidate_threshold"] = decision.candidate_threshold
 
     def send(kind_name: str, priority: str = "default") -> None:
-        title, message = app.build_notification_message(result, kind_name)
+        title, message = app.build_notification_message(result, kind_name, decision)
         app.send_ntfy_notification(
             str(config["topic"]),
             title,
@@ -422,8 +434,14 @@ def main() -> None:
     result = app.analyze_market()
     if args.no_notify:
         state = load_state(state_path, str(config.get("dashboard_url", "")))
+        decision = app.live_filter_decision(result, config)
         state["last_checked_at"] = datetime.now(app.JST).isoformat()
         state["last_status"] = "dashboard only"
+        state["last_filter_label"] = decision.label
+        state["last_filter_reason"] = decision.reason
+        state["last_filter_notes"] = list(decision.notes)
+        state["last_filter_main_threshold"] = decision.main_threshold
+        state["last_filter_candidate_threshold"] = decision.candidate_threshold
         write_json(state_path, state)
     else:
         state = maybe_notify(result, state_path)

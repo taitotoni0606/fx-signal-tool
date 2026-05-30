@@ -39,6 +39,7 @@ jobs:
           SCORE_THRESHOLD: "68"
           CANDIDATE_SCORE_THRESHOLD: "50"
           DAILY_SUMMARY_HOUR: "8"
+          LIVE_FILTER_ENABLED: "true"
           COOLDOWN_MINUTES: "180"
           NOTIFY_DURING_HIGH_EVENT: "false"
           DASHBOARD_URL: "https://taitotoni0606.github.io/fx-signal-tool/"
