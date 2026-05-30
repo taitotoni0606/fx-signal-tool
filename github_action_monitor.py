@@ -37,6 +37,8 @@ def github_config() -> dict[str, object]:
         "enabled": env_bool("NOTIFY_ENABLED", True),
         "topic": os.getenv("NTFY_TOPIC", "").strip(),
         "score_threshold": int(os.getenv("SCORE_THRESHOLD", "68")),
+        "candidate_score_threshold": int(os.getenv("CANDIDATE_SCORE_THRESHOLD", "50")),
+        "daily_summary_hour": int(os.getenv("DAILY_SUMMARY_HOUR", "8")),
         "cooldown_minutes": int(os.getenv("COOLDOWN_MINUTES", "180")),
         "notify_during_high_event": env_bool("NOTIFY_DURING_HIGH_EVENT", False),
         "dashboard_url": normalize_url(os.getenv("DASHBOARD_URL", default_dashboard_url())),
@@ -330,18 +332,10 @@ def maybe_notify(result: app.AnalysisResult, state_path: Path) -> dict[str, obje
     state = load_state(state_path, str(config.get("dashboard_url", "")))
     now = datetime.now(app.JST)
 
-    ok, reason = app.is_entry_chance(result.setup, result.event_risk, config)
     state["last_checked_at"] = now.isoformat()
 
     if not config["enabled"]:
         state["last_status"] = "通知無効"
-        write_json(state_path, state)
-        return state
-
-    if not ok:
-        state["last_status"] = reason
-        if result.setup.bias == "wait":
-            state["last_signal_key"] = ""
         write_json(state_path, state)
         return state
 
@@ -350,37 +344,69 @@ def maybe_notify(result: app.AnalysisResult, state_path: Path) -> dict[str, obje
         write_json(state_path, state)
         return state
 
-    key = app.signal_key(result.setup)
-    last_key = str(state.get("last_signal_key", ""))
-    last_sent_at = parse_time(state.get("last_sent_at"))
-    cooldown = timedelta(minutes=int(config.get("cooldown_minutes", 180)))
-    same_side = key == last_key or last_key.startswith(f"{key}|")
-    if same_side and last_sent_at and now - last_sent_at < cooldown:
-        state["last_status"] = "cooldown"
+    kind, reason = app.notification_kind(result.setup, result.event_risk, config)
+    today = now.date().isoformat()
+    dashboard_url = str(config.get("dashboard_url", ""))
+
+    def send(kind_name: str, priority: str = "default") -> None:
+        title, message = app.build_notification_message(result, kind_name)
+        app.send_ntfy_notification(
+            str(config["topic"]),
+            title,
+            message,
+            priority=priority,
+            click_url=dashboard_url,
+        )
+        state.update(
+            {
+                "last_notification_date": today,
+                "last_sent_at": now.isoformat(),
+                "last_status": f"{kind_name} sent",
+                "last_title": title,
+                "last_message": message,
+            }
+        )
+        state[f"last_{kind_name}_sent_at"] = now.isoformat()
+        state[f"last_{kind_name}_title"] = title
+        state[f"last_{kind_name}_message"] = message
+
+    if kind == "main":
+        key = app.signal_key(result.setup)
+        last_key = str(state.get("last_main_signal_key", state.get("last_signal_key", "")))
+        last_sent_at = parse_time(state.get("last_main_sent_at") or state.get("last_sent_at"))
+        cooldown = timedelta(minutes=int(config.get("cooldown_minutes", 180)))
+        same_side = key == last_key or last_key.startswith(f"{key}|")
+        if same_side and last_sent_at and now - last_sent_at < cooldown:
+            state["last_status"] = "本命cooldown"
+            write_json(state_path, state)
+            return state
+        priority = "high" if result.setup.score >= int(config.get("score_threshold", 68)) + 8 else "default"
+        send("main", priority)
+        state["last_signal_key"] = key
+        state["last_main_signal_key"] = key
         write_json(state_path, state)
         return state
 
-    title, message = app.build_notification_message(result)
-    priority = "high" if result.setup.score >= int(config.get("score_threshold", 68)) + 8 else "default"
-    app.send_ntfy_notification(
-        str(config["topic"]),
-        title,
-        message,
-        priority=priority,
-        click_url=str(config.get("dashboard_url", "")),
-    )
-    state.update(
-        {
-            "last_signal_key": key,
-            "last_sent_at": now.isoformat(),
-            "last_status": "sent",
-            "last_title": title,
-            "last_message": message,
-        }
-    )
+    if kind == "candidate":
+        send("candidate", "default")
+        state["last_candidate_signal_key"] = app.signal_key(result.setup)
+        write_json(state_path, state)
+        return state
+
+    daily_hour = int(config.get("daily_summary_hour", 8))
+    sent_any_today = state.get("last_notification_date") == today
+    already_sent_daily = state.get("last_daily_summary_date") == today
+    if now.hour >= daily_hour and not sent_any_today and not already_sent_daily:
+        send("daily", "low")
+        state["last_daily_summary_date"] = today
+        write_json(state_path, state)
+        return state
+
+    state["last_status"] = reason
+    if result.setup.bias == "wait":
+        state["last_signal_key"] = ""
     write_json(state_path, state)
     return state
-
 
 def main() -> None:
     parser = argparse.ArgumentParser()

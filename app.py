@@ -1036,6 +1036,8 @@ def default_notification_config() -> dict[str, object]:
         "enabled": True,
         "topic": f"usdjpy-signal-{secrets.token_hex(8)}",
         "score_threshold": 68,
+        "candidate_score_threshold": 50,
+        "daily_summary_hour": 8,
         "interval_minutes": 15,
         "cooldown_minutes": 180,
         "notify_during_high_event": False,
@@ -1132,18 +1134,36 @@ def is_entry_chance(setup: Setup, event_risk: EventRisk, config: dict[str, objec
     return True, "通知対象"
 
 
+def notification_kind(setup: Setup, event_risk: EventRisk, config: dict[str, object]) -> tuple[str, str]:
+    main_threshold = int(config.get("score_threshold", 68))
+    candidate_threshold = int(config.get("candidate_score_threshold", 50))
+    allow_high_event = bool(config.get("notify_during_high_event", False))
+    if setup.bias not in {"buy", "sell"}:
+        return "none", "売買方向なし"
+    if event_risk.level == "high" and not allow_high_event:
+        return "none", "重要イベント前後"
+    if setup.score >= main_threshold:
+        return "main", f"本命 ({setup.score}% >= {main_threshold}%)"
+    if setup.score >= candidate_threshold:
+        return "candidate", f"候補 ({setup.score}% >= {candidate_threshold}%)"
+    return "none", f"候補条件未満 ({setup.score}% < {candidate_threshold}%)"
+
+
 def signal_key(setup: Setup) -> str:
     return setup.bias
 
 
-def build_notification_message(result: AnalysisResult) -> tuple[str, str]:
+def build_notification_message(result: AnalysisResult, kind: str = "main") -> tuple[str, str]:
     setup = result.setup
-    side = "BUY" if setup.bias == "buy" else "SELL"
-    title = f"USDJPY {side} {setup.score}%"
+    side = {"buy": "BUY", "sell": "SELL", "wait": "WAIT"}.get(setup.bias, "WAIT")
+    kind_title = {"main": "MAIN", "candidate": "CANDIDATE", "daily": "DAILY"}.get(kind, "SIGNAL")
+    kind_label = {"main": "本命", "candidate": "候補", "daily": "日次チェック"}.get(kind, "通知")
+    title = f"USDJPY {kind_title} {side} {setup.score}%"
     stop = "未設定" if setup.bias == "wait" else fmt_price(setup.stop, PAIR)
     target = "未設定" if setup.bias == "wait" else f"{fmt_price(setup.target_1, PAIR)} / {fmt_price(setup.target_2, PAIR)}"
     reasons = " / ".join(setup.reasons[:3])
     message = (
+        f"{kind_label}\n"
         f"{setup.direction}\n"
         f"現在価格: {fmt_price(result.current_price, PAIR)}\n"
         f"候補ゾーン: {fmt_price(setup.entry_low, PAIR)} - {fmt_price(setup.entry_high, PAIR)}\n"
